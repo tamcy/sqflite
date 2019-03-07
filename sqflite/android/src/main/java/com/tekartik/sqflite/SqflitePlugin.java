@@ -62,12 +62,12 @@ public class SqflitePlugin implements MethodCallHandler {
 
     private final Object databaseMapLocker = new Object();
     private Context context;
-    private int databaseOpenCount = 0;
-    private int databaseId = 0; // incremental database id
+    private static int databaseOpenCount = 0;
+    private static int databaseId = 0; // incremental database id
 
     // Database thread execution
-    private HandlerThread handlerThread;
-    private Handler handler;
+    private static HandlerThread handlerThread;
+    private static Handler handler;
 
     private Context getContext() {
         return context;
@@ -114,7 +114,11 @@ public class SqflitePlugin implements MethodCallHandler {
     }
 
     @SuppressLint("UseSparseArrays")
-    private Map<Integer, Database> databaseMap = new HashMap<>();
+    private static Map<Integer, Database> databaseMap = new HashMap<>();
+
+    private static Map<String, Integer> databasePathIdMap = new HashMap<>();
+
+    private static Map<Integer, Integer> databaseRefCount = new HashMap<>();
 
     SqflitePlugin(Context context) {
         this.context = context;
@@ -646,26 +650,46 @@ public class SqflitePlugin implements MethodCallHandler {
         }
 
         int databaseId;
+        boolean shouldOpenDatabase = false;
         synchronized (databaseMapLocker) {
-            databaseId = ++this.databaseId;
-        }
-        Database database = new Database(context, path);
-        // force opening
-        try {
-            if (Boolean.TRUE.equals(readOnly)) {
-                database.openReadOnly();
+            if (databasePathIdMap.containsKey(path)) {
+                databaseId = databasePathIdMap.get(path);
             } else {
-                database.open();
+                databaseId = ++this.databaseId;
+                shouldOpenDatabase = true;
             }
-        } catch (Exception e) {
-            MethodCallOperation operation = new MethodCallOperation(call, result);
-            handleException(e, operation, database);
-            return;
+        }
+
+        Database database;
+        if (shouldOpenDatabase) {
+            database = new Database(context, path);
+            // force opening
+            try {
+                if (Boolean.TRUE.equals(readOnly)) {
+                    database.openReadOnly();
+                } else {
+                    database.open();
+                }
+
+                databasePathIdMap.put(path, databaseId);
+                if (databaseRefCount.containsKey(databaseId)) {
+                    databaseRefCount.put(databaseId, databaseRefCount.get(databaseId) + 1);
+                } else {
+                    databaseRefCount.put(databaseId, 1);
+                }
+
+            } catch (Exception e) {
+                MethodCallOperation operation = new MethodCallOperation(call, result);
+                handleException(e, operation, database);
+                return;
+            }
+        } else {
+            database = databaseMap.get(databaseId);
         }
 
         //SQLiteDatabase sqLiteDatabase = SQLiteDatabase.openDatabase(path, null, 0);
         synchronized (databaseMapLocker) {
-            if (databaseOpenCount++ == 0) {
+            if (shouldOpenDatabase && databaseOpenCount++ == 0) {
                 handlerThread = new HandlerThread("Sqflite", SqflitePlugin.THREAD_PRIORITY);
                 handlerThread.start();
                 //TEST UI  Handler
@@ -675,6 +699,7 @@ public class SqflitePlugin implements MethodCallHandler {
                     Log.d(Constant.TAG, "starting thread" + handlerThread + " priority " + SqflitePlugin.THREAD_PRIORITY);
                 }
             }
+
             databaseMap.put(databaseId, database);
             if (Debug.LOGV) {
                 Log.d(Constant.TAG, "[" + Thread.currentThread() + "] opened " + databaseId + " " + path + " total open count (" + databaseOpenCount + ")");
@@ -696,20 +721,40 @@ public class SqflitePlugin implements MethodCallHandler {
         if (Debug.LOGV) {
             Log.d(Constant.TAG, "[" + Thread.currentThread() + "] closing " + databaseId + " " + database.path + " total open count (" + databaseOpenCount + ")");
         }
-        database.close();
+
+        boolean closeDB = false;
 
         synchronized (databaseMapLocker) {
-            databaseMap.remove(databaseId);
-            if (--databaseOpenCount == 0) {
-                if (Debug.LOGV) {
-                    Log.d(Constant.TAG, "stopping thread" + handlerThread);
-                }
-                handlerThread.quit();
-                handlerThread = null;
-                handler = null;
+            Integer refCount = databaseRefCount.get(databaseId);
+            if (refCount == 1) {
+                databaseRefCount.remove(databaseId);
+                closeDB = true;
+            } else {
+                databaseRefCount.put(databaseId, refCount - 1);
             }
         }
 
+        if (closeDB) {
+            database.close();
+
+            synchronized (databaseMapLocker) {
+                databaseMap.remove(databaseId);
+                for (Map.Entry<String, Integer> entry : databasePathIdMap.entrySet()) {
+                    if (entry.getValue() == databaseId) {
+                        databasePathIdMap.remove(entry.getKey());
+                    }
+                }
+
+                if (--databaseOpenCount == 0) {
+                    if (Debug.LOGV) {
+                        Log.d(Constant.TAG, "stopping thread" + handlerThread);
+                    }
+                    handlerThread.quit();
+                    handlerThread = null;
+                    handler = null;
+                }
+            }
+        }
 
         result.success(null);
     }
